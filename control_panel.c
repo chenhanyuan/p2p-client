@@ -5,16 +5,19 @@
 
 #define BTN_LIVE 1001
 #define BTN_PLAYBACK 1002
+#define BTN_RECORD_LIST 1003
 
 // 控制面板结构
 struct ControlPanel {
     HWND hwnd;
     HWND btn_live;
     HWND btn_playback;
+    HWND btn_record_list;
     HWND status_label;
     
     ButtonCallback live_callback;
     ButtonCallback playback_callback;
+    ButtonCallback record_list_callback;
     void* user_data;
     
     int running;
@@ -41,6 +44,12 @@ LRESULT CALLBACK ControlPanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     SetWindowTextW(g_panel->status_label, L"状态: 正在启动录像回放...");
                     g_panel->playback_callback(g_panel->user_data);
                     SetWindowTextW(g_panel->status_label, L"状态: 录像回放已启动");
+                }
+                else if (button_id == BTN_RECORD_LIST && g_panel->record_list_callback) {
+                    printf("[ControlPanel] RecordList button clicked\n");
+                    SetWindowTextW(g_panel->status_label, L"状态: 查询录像列表...");
+                    g_panel->record_list_callback(g_panel->user_data);
+                    SetWindowTextW(g_panel->status_label, L"状态: 录像列表已查询");
                 }
             }
             break;
@@ -170,12 +179,37 @@ ControlPanel* control_panel_create(const char* title,
     
     SendMessage(panel->btn_playback, WM_SETFONT, (WPARAM)hFont, TRUE);
     
+    // 创建录像列表按钮
+    panel->btn_record_list = CreateWindowW(
+        L"BUTTON",
+        L"录像列表",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        50, 120, 120, 32,
+        panel->hwnd,
+        (HMENU)BTN_RECORD_LIST,
+        GetModuleHandle(NULL),
+        NULL
+    );
+    SendMessage(panel->btn_record_list, WM_SETFONT, (WPARAM)hFont, TRUE);
+    
     // 显示窗口
     ShowWindow(panel->hwnd, SW_SHOW);
     UpdateWindow(panel->hwnd);
     
     printf("[ControlPanel] Control panel created\n");
     
+    return panel;
+}
+
+// 创建三按钮面板（包装现有创建函数并设置 record_list_callback）
+ControlPanel* control_panel_create_with_record_list(const char* title,
+                                   ButtonCallback live_callback,
+                                   ButtonCallback playback_callback,
+                                   ButtonCallback record_list_callback,
+                                   void* user_data) {
+    ControlPanel* panel = control_panel_create(title, live_callback, playback_callback, user_data);
+    if (!panel) return NULL;
+    panel->record_list_callback = record_list_callback;
     return panel;
 }
 

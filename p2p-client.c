@@ -69,10 +69,9 @@ typedef enum {
     JSON_CMD_AUTOPHOTO_SET           = 0x312  // 设置自动拍照参数
 } ELD_CMD_CODE;
 
-// 函数声明
-int build_command_package(const char* json_data, unsigned char* package, int max_len,
-                         unsigned short pkg_id, unsigned short pkg_cmd);
-int handle_command_package(const unsigned char* package, int pkg_len);
+// 全局序号管理（用于统一的 JSON seq / pkg id）
+static unsigned short s_global_pkg_id = 1;
+static unsigned short s_global_seq = 0;
 
 // 包头结构体
 #pragma pack(1)
@@ -534,75 +533,26 @@ void on_frame_decoded(VideoFrame* frame, void* user_data) {
     }
 }
 
-// 发送视频请求命令
-int send_video_command(INT32 session_handle, const char* target_did, int stream_type) {
+// 函数声明
+int build_command_package(const char* json_data, unsigned char* package, int max_len,
+                         unsigned short pkg_id, unsigned short pkg_cmd);
+int handle_command_package(const unsigned char* package, int pkg_len);
+// 统一封装：构建包并发送（封装 build_command_package + PPCS_Write）
+int send_command(INT32 session_handle, const char* json_data, unsigned short pkg_id, unsigned short pkg_cmd) {
     unsigned char package[BUFFER_SIZE];
-    int pkg_len;
-    static unsigned short pkg_id = 1;
-    static unsigned short pkg_seq = 0;
-    unsigned short pkg_cmd;
-    
-    // 构建 JSON 请求
-    char json_request[MAX_JSON_LEN];
-    const char* stream_name = (stream_type == 1) ? "live" : "playback";
-    
-    if (stream_type == 1) {
-        snprintf(json_request, sizeof(json_request),
-                "{"
-                "\"version\":\"1.0\","
-                "\"ack\":false,"
-                "\"seq\":%d,"
-                "\"cmd\":257,"
-                "\"def\":\"JSON_CMD_VIDEO_START\","
-                "\"id\":\"%s\","
-                "\"user\":\"user-123\""
-                "}",
-                pkg_seq++, target_did);
-        pkg_cmd = JSON_CMD_VIDEO_START;
-    } else if (stream_type == 3) {
-        snprintf(json_request, sizeof(json_request),
-                "{"
-                "\"version\":\"1.0\","
-                "\"ack\":false,"
-                "\"seq\":%d,"
-                "\"cmd\":513,"
-                "\"def\":\"JSON_CMD_PLAYBACK_START\","
-                "\"id\":\"%s\","
-                "\"user\":\"user-123\","
-                "\"data\":{"
-                "\"start_time\":\"2024-01-01T12:00:00Z\","
-                "\"end_time\":\"2024-01-01T12:30:00Z\""
-                "}"
-                "}",
-                pkg_seq++, target_did);
-        pkg_cmd = JSON_CMD_PLAYBACK_START;
-    } else {
-        printf("[ERROR] Unsupported stream type: %d\n", stream_type);
+    int pkg_len = build_command_package(json_data, package, sizeof(package), pkg_id, pkg_cmd);
+    if (pkg_len < 0) {
+        printf("[Command] Failed to build package (pkg_id=%d, pkg_cmd=0x%04X)\n", pkg_id, pkg_cmd);
         return -1;
     }
 
-    
-    printf("[Command] Sending VIDEO_START command for stream %d (%s)...\n", 
-           stream_type, stream_name);
-    printf("[Command] JSON: %s\n\n", json_request);
-    
-    // 构建命令包
-    pkg_len = build_command_package(json_request, package, sizeof(package), 
-                                    pkg_id++, pkg_cmd);
-    
-    if (pkg_len < 0) {
-        printf("[ERROR] Failed to build command package\n");
-        return -1;
-    }
-    
-    // 发送命令
     INT32 ret = PPCS_Write(session_handle, CHANNEL, (char*)package, pkg_len);
     if (ret < 0) {
         print_error("PPCS_Write", ret);
         return -1;
     }
-    
-    printf("[Command] Sent: %d bytes\n\n", ret);
+
+    printf("[Command] Sent: %d bytes (pkg_id=%d, pkg_cmd=0x%04X)\n", ret, pkg_id, pkg_cmd);
     return 0;
 }
 
@@ -615,11 +565,28 @@ void on_live_button_clicked(void* user_data) {
     }
     
     printf("[App] Starting live stream...\n");
-    
-    // 发送直播视频请求（stream_type=1）
-    if (send_video_command(ctx->session_handle, "", 1) == 0) {
+    // 统一实现：构建 JSON 并通过 send_command 发送
+    char json_request[MAX_JSON_LEN];
+    // 使用空 id 与固定 user（与之前实现保持一致）
+    const char* id = "Android_1c775ac30545f25a";
+    const char* user = "29566628-5071-47e7-b5f5-9cc3849c9ade";
+    snprintf(json_request, sizeof(json_request),
+             "{"
+             "\"version\":\"1.0\","
+             "\"ack\":false,"
+             "\"seq\":%d,"
+             "\"cmd\":257,"
+             "\"def\":\"JSON_CMD_VIDEO_START\","
+             "\"id\":\"%s\","
+             "\"user\":\"%s\""
+             "}",
+             s_global_seq++, id, user);
+
+    if (send_command(ctx->session_handle, json_request, s_global_pkg_id++, JSON_CMD_VIDEO_START) == 0) {
         ctx->live_started = 1;
         printf("[App] Live stream started\n");
+    } else {
+        printf("[App] Failed to start live stream\n");
     }
 }
 
@@ -632,12 +599,54 @@ void on_playback_button_clicked(void* user_data) {
     }
     
     printf("[App] Starting playback stream...\n");
-    
-    // 发送录像视频请求（stream_type=3）
-    if (send_video_command(ctx->session_handle, "", 3) == 0) {
+    // 统一实现：构建 JSON 并通过 send_command 发送（回放）
+    char json_request[MAX_JSON_LEN];
+    const char* id = "Android_1c775ac30545f25a";
+    const char* user = "29566628-5071-47e7-b5f5-9cc3849c9ade";
+    // 示例时间窗口（可按需修改或扩展为 UI 输入）
+    const char* start_time = "2024-01-01T12:00:00Z";
+    const char* end_time = "2024-01-01T12:30:00Z";
+    snprintf(json_request, sizeof(json_request),
+             "{"
+             "\"version\":\"1.0\","
+             "\"ack\":false,"
+             "\"seq\":%d,"
+             "\"cmd\":513,"
+             "\"def\":\"JSON_CMD_PLAYBACK_START\","
+             "\"id\":\"%s\","
+             "\"user\":\"%s\","
+             "\"data\":{\"start_time\":\"%s\",\"end_time\":\"%s\"}"
+             "}",
+             s_global_seq++, id, user, start_time, end_time);
+
+    if (send_command(ctx->session_handle, json_request, s_global_pkg_id++, JSON_CMD_PLAYBACK_START) == 0) {
         ctx->playback_started = 1;
         printf("[App] Playback stream started\n");
+    } else {
+        printf("[App] Failed to start playback stream\n");
     }
+}
+
+// 录像列表按钮回调
+void on_record_list_button_clicked(void* user_data) {
+    AppContext* ctx = (AppContext*)user_data;
+    if (!ctx) return;
+    printf("[App] Querying record list (UI)...\n");
+    // 构造JSON请求，字段按用户提供的协议
+    char json_request[MAX_JSON_LEN];
+    const char* id = "Android_1c775ac30545f25a";
+    const char* user = "29566628-5071-47e7-b5f5-9cc3849c9ade";
+    int starttime = 1765190126;
+    int endtime = 1765190136;
+    snprintf(json_request, sizeof(json_request),
+        "{\"version\":\"1.0\",\"ack\":false,\"seq\":%d,\"cmd\":0x207,\"def\":\"JSON_CMD_RECORD_LIST_GET\",\"id\":\"%s\",\"user\":\"%s\",\"data\":{\"starttime\":%d,\"endtime\":%d}}",
+        s_global_seq++, id, user, starttime, endtime);
+
+    if (send_command(ctx->session_handle, json_request, s_global_pkg_id++, 0x207) != 0) {
+        printf("[App] Failed to send record list command\n");
+        return;
+    }
+    printf("[App] Record list command sent\n");
 }
 
 // 处理视频数据包 - 支持多流分发
@@ -657,8 +666,9 @@ int handle_video_package(VideoStreamManager* mgr,
     TAG_PKG_HEADER_S* header = (TAG_PKG_HEADER_S*)(package + offset);
     offset += sizeof(TAG_PKG_HEADER_S);
     // 打印包头信息（每30个包打印一次，减少日志）
+        #if 0
         static int header_log_counter = 0;
-        //if (header_log_counter++ % 30 == 0) {
+        if (header_log_counter++ % 30 == 0) {
             printf("[Video] Package Header:\n");
             printf("  PkgIdent: 0x%04X\n", header->s16PkgIdent);
             printf("  PkgLen: %d\n", header->u16PkgLen);
@@ -668,7 +678,8 @@ int handle_video_package(VideoStreamManager* mgr,
             printf("  PkgCmd: 0x%04X\n", header->u16PkgCmd);
             printf("  PkgSubHead: %d\n", header->u8PkgSubHead);
             printf("  PkgUserData: %llu\n", header->u64PkgUserData);
-        //}
+        }
+        #endif
     
     // 分片重组缓存结构
     typedef struct {
@@ -848,6 +859,66 @@ int handle_command_package(const unsigned char* package,
     
     printf("[Response] %s\n", json_response);
     
+    // 如果是录像列表响应（cmd=0x207 或 包体包含 JSON_CMD_RECORD_LIST_GET），解析并打印
+    if (header->u16PkgCmd == 0x207 || strstr(json_response, "JSON_CMD_RECORD_LIST_GET") != NULL) {
+        printf("[RecordList] Parsing record list response...\n");
+        // 轻量解析 record_list 数组
+        const char* p = strstr(json_response, "\"record_list\"");
+        if (!p) {
+            printf("[RecordList] No record_list found in response\n");
+        } else {
+            // 找到 '['
+            const char* arr = strchr(p, '[');
+            if (!arr) {
+                printf("[RecordList] Malformed record_list\n");
+            } else {
+                const char* cur = arr + 1;
+                int idx = 0;
+                while (cur && *cur) {
+                    // 查找下一个 '{'
+                    const char* obj = strchr(cur, '{');
+                    if (!obj) break;
+                    const char* end_obj = strchr(obj, '}');
+                    if (!end_obj) break;
+                    // 在 obj..end_obj 区间解析 start_time, end_time, record_type
+                    int start_time = 0, end_time = 0;
+                    char type_buf[64] = {0};
+                    const int seg_len = (int)(end_obj - obj + 1);
+                    char seg[512] = {0};
+                    int copy_len = seg_len < (int)sizeof(seg)-1 ? seg_len : (int)sizeof(seg)-1;
+                    memcpy(seg, obj, copy_len);
+                    seg[copy_len] = '\0';
+                    // start_time
+                    const char* ps = strstr(seg, "\"start_time\"");
+                    if (ps) sscanf(ps, "\"start_time\"%*[^0-9]%d", &start_time);
+                    const char* pe = strstr(seg, "\"end_time\"");
+                    if (pe) sscanf(pe, "\"end_time\"%*[^0-9]%d", &end_time);
+                    const char* pt = strstr(seg, "\"record_type\"");
+                    if (pt) {
+                        // 找到冒号后面的字符串
+                        const char* q = strchr(pt, ':');
+                        if (q) {
+                            // 跳过空格和引号
+                            q++;
+                            while (*q == ' ' || *q == '\"' || *q == '\t') q++;
+                            int i = 0;
+                            while (*q && *q != '"' && *q != ',' && *q != '}' && i < (int)sizeof(type_buf)-1) {
+                                type_buf[i++] = *q++;
+                            }
+                            type_buf[i] = '\0';
+                        }
+                    }
+                    printf("[RecordList][%d] start_time=%d, end_time=%d, type=%s\n", idx++, start_time, end_time, type_buf[0]?type_buf:"(unknown)");
+                    cur = end_obj + 1;
+                    // 跳过逗号和空白
+                    const char* comma = strchr(cur, ',');
+                    if (comma) cur = comma + 1;
+                }
+            }
+        }
+        return 0;
+    }
+
     // 检查响应是否成功
     if (strstr(json_response, "\"code\":200") != NULL) {
         printf("[SUCCESS] Command executed successfully\n");
@@ -856,7 +927,7 @@ int handle_command_package(const unsigned char* package,
         printf("[INFO] Command acknowledged\n");
         return 0;
     }
-    
+
     return 0;
 }
 
@@ -1120,11 +1191,12 @@ int main(int argc, char* argv[]) {
     app_ctx.live_started = 0;
     app_ctx.playback_started = 0;
     
-    // 创建控制面板
-    ControlPanel* panel = control_panel_create(
+    // 创建三按钮控制面板（直播 / 回放 / 录像列表）
+    ControlPanel* panel = control_panel_create_with_record_list(
         "P2P 视频控制面板",
         on_live_button_clicked,
         on_playback_button_clicked,
+        on_record_list_button_clicked,
         &app_ctx
     );
     

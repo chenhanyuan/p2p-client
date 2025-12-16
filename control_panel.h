@@ -9,6 +9,13 @@ typedef struct ControlPanel ControlPanel;
 // 按钮回调函数类型
 typedef void (*ButtonCallback)(void* user_data);
 
+// 三按钮面板（直播、回放、录像列表）创建函数声明
+ControlPanel* control_panel_create_with_record_list(const char* title,
+                                   ButtonCallback live_callback,
+                                   ButtonCallback playback_callback,
+                                   ButtonCallback record_list_callback,
+                                   void* user_data);
+
 /**
  * 创建控制面板
  * @param title 窗口标题
