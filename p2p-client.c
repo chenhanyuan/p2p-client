@@ -4,6 +4,7 @@
 #include <time.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #include "PPCS_API.h"
 #include "video_decoder.h"
 #include "video_display_gdi.h"
@@ -72,6 +73,20 @@ typedef enum {
 // 全局序号管理（用于统一的 JSON seq / pkg id）
 static unsigned short s_global_pkg_id = 1;
 static unsigned short s_global_seq = 0;
+
+// 网络读取线程 -> 完整包队列
+typedef struct PackageNode {
+    unsigned char* data;
+    int len;
+    struct PackageNode* next;
+} PackageNode;
+
+static PackageNode* g_pkg_head = NULL;
+static PackageNode* g_pkg_tail = NULL;
+static CRITICAL_SECTION g_pkg_cs;
+static HANDLE g_pkg_event = NULL; // 用于唤醒
+static HANDLE g_net_thread = NULL;
+static volatile int g_net_thread_run = 0;
 
 // 包头结构体
 #pragma pack(1)
@@ -531,6 +546,111 @@ void on_frame_decoded(VideoFrame* frame, void* user_data) {
     if (!video_display_poll_events(stream->display)) {
         printf("[Stream%d] Display window closed by user\n", stream->stream_type);
     }
+}
+
+// 将完整包入队（网络线程调用）
+static void push_package_to_queue(unsigned char* data, int len) {
+    PackageNode* node = (PackageNode*)malloc(sizeof(PackageNode));
+    if (!node) {
+        free(data);
+        return;
+    }
+    node->data = data;
+    node->len = len;
+    node->next = NULL;
+
+    EnterCriticalSection(&g_pkg_cs);
+    if (g_pkg_tail) {
+        g_pkg_tail->next = node;
+        g_pkg_tail = node;
+    } else {
+        g_pkg_head = g_pkg_tail = node;
+    }
+    LeaveCriticalSection(&g_pkg_cs);
+
+    // 发信号
+    if (g_pkg_event) SetEvent(g_pkg_event);
+}
+
+// 从队列弹出一个包，返回节点（caller 负责 free node->data 和 free(node)）
+static PackageNode* pop_package_from_queue(void) {
+    PackageNode* node = NULL;
+    EnterCriticalSection(&g_pkg_cs);
+    if (g_pkg_head) {
+        node = g_pkg_head;
+        g_pkg_head = g_pkg_head->next;
+        if (!g_pkg_head) g_pkg_tail = NULL;
+    }
+    LeaveCriticalSection(&g_pkg_cs);
+    return node;
+}
+
+// 网络读取线程：阻塞读、组装完整包并入队
+static DWORD WINAPI network_reader_thread(LPVOID lpParam) {
+    INT32 session_handle = (INT32)(intptr_t)lpParam;
+    unsigned char* recv_buffer = (unsigned char*)malloc(RECV_BUFFER_SIZE);
+    if (!recv_buffer) return 0;
+    int buffer_data_len = 0;
+
+    g_net_thread_run = 1;
+
+    while (g_net_thread_run) {
+        unsigned char temp_buffer[BUFFER_SIZE];
+        INT32 read_len = sizeof(temp_buffer);
+        INT32 ret = PPCS_Read(session_handle, CHANNEL, (char*)temp_buffer, &read_len, 1000);
+        if (ret == ERROR_PPCS_SUCCESSFUL && read_len > 0) {
+            // 追加到本地重组缓冲区
+            if (buffer_data_len + read_len <= RECV_BUFFER_SIZE) {
+                memcpy(recv_buffer + buffer_data_len, temp_buffer, read_len);
+                buffer_data_len += read_len;
+            } else {
+                // 缓冲区被填满，重置以避免溢出
+                buffer_data_len = 0;
+                continue;
+            }
+
+            // 尝试解析完整的包并入队
+            while (buffer_data_len >= 40) {
+                int is_json = (memcmp(recv_buffer, PKG_JSON_PREFIX, 4) == 0);
+                int is_video = (memcmp(recv_buffer, PKG_VIDEO_PREFIX, 4) == 0);
+                if (!is_json && !is_video) {
+                    // 跳过无效字节
+                    memmove(recv_buffer, recv_buffer + 1, buffer_data_len - 1);
+                    buffer_data_len--;
+                    continue;
+                }
+
+                if (buffer_data_len < 4 + sizeof(TAG_PKG_HEADER_S)) break;
+                TAG_PKG_HEADER_S* header = (TAG_PKG_HEADER_S*)(recv_buffer + 4);
+                int pkg_len = 4 + sizeof(TAG_PKG_HEADER_S) + header->u16PkgLen + sizeof(TAG_PKG_TAIL_S);
+                if (pkg_len < 40 || pkg_len > RECV_BUFFER_SIZE) {
+                    // 非法包长度，跳过前4字节
+                    memmove(recv_buffer, recv_buffer + 4, buffer_data_len - 4);
+                    buffer_data_len -= 4;
+                    continue;
+                }
+
+                if (buffer_data_len < pkg_len) break; // 等待更多数据
+
+                // 完整包
+                unsigned char* pkg = (unsigned char*)malloc(pkg_len);
+                if (pkg) {
+                    memcpy(pkg, recv_buffer, pkg_len);
+                    push_package_to_queue(pkg, pkg_len);
+                }
+
+                // 移除已消费的数据
+                memmove(recv_buffer, recv_buffer + pkg_len, buffer_data_len - pkg_len);
+                buffer_data_len -= pkg_len;
+            }
+        } else {
+            // PPCS_Read 出错或超时（ret<0 或 read_len==0），继续循环
+            // 如果遇到严重错误可以考虑退出线程
+        }
+    }
+
+    free(recv_buffer);
+    return 0;
 }
 
 // 函数声明
@@ -1169,6 +1289,17 @@ int main(int argc, char* argv[]) {
         return -1;
     }
     
+    // 初始化网络线程队列与线程
+    InitializeCriticalSection(&g_pkg_cs);
+    g_pkg_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+    DWORD tid = 0;
+    g_net_thread = CreateThread(NULL, 0, network_reader_thread, (LPVOID)(intptr_t)session_handle, 0, &tid);
+    if (!g_net_thread) {
+        printf("[WARN] Failed to create network reader thread\n");
+    } else {
+        printf("[Info] Network reader thread started (tid=%u)\n", (unsigned)tid);
+    }
+    
     Sleep(1000);
     // ====== 创建控制面板和数据处理 ======
     printf("================================================\n");
@@ -1214,8 +1345,6 @@ int main(int argc, char* argv[]) {
     
     // 主循环：处理控制面板事件 + 接收视频数据
     // 使用简化的接收循环（后续可以改成线程）
-    unsigned char recv_buffer[RECV_BUFFER_SIZE];
-    int buffer_data_len = 0;
     time_t start_time = time(NULL);
     
     while (1) {
@@ -1238,69 +1367,26 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        // 接收和处理网络数据（非阻塞，10ms超时）
-        unsigned char temp_buffer[BUFFER_SIZE];
-        INT32 read_len = sizeof(temp_buffer);
-        // PPCS_Read(session_handle, CHANNEL, (char*)temp_buffer, &read_len, 10);  这个一定不能 10, 不然数据接收会有问题
-        ret = PPCS_Read(session_handle, CHANNEL, (char*)temp_buffer, &read_len, 1000); 
-        
-        if (ret == ERROR_PPCS_SUCCESSFUL && read_len > 0) {
-            // 追加到接收缓冲区
-            if (buffer_data_len + read_len <= RECV_BUFFER_SIZE) {
-                memcpy(recv_buffer + buffer_data_len, temp_buffer, read_len);
-                buffer_data_len += read_len;
-                
-                // 尝试解析完整的包
-                while (buffer_data_len >= 40) {  // 最小包长度
-                    int is_json = (memcmp(recv_buffer, PKG_JSON_PREFIX, 4) == 0);
-                    int is_video = (memcmp(recv_buffer, PKG_VIDEO_PREFIX, 4) == 0);
-                    
-                    if (!is_json && !is_video) {
-                        // 跳过无效字节
-                           static int skip_count = 0;
-                           if (skip_count++ % 100 == 0) {
-                               printf("[Parse] Skipping invalid byte: 0x%02X (total %d skipped)\n", 
-                                      recv_buffer[0], skip_count);
-                           }
-                        memmove(recv_buffer, recv_buffer + 1, buffer_data_len - 1);
-                        buffer_data_len--;
-                        continue;
-                    }
-                    
-                    TAG_PKG_HEADER_S* header = (TAG_PKG_HEADER_S*)(recv_buffer + 4);
-                    int pkg_len = 4 + sizeof(TAG_PKG_HEADER_S) + header->u16PkgLen + sizeof(TAG_PKG_TAIL_S);
-                    //printf("pkg_len=%d, u16PkgLen=%d, u16PkgId=%d\n", pkg_len, header->u16PkgLen, header->u16PkgId);
-                    
-                    // 验证包长度是否合理（防止错误的 u16PkgLen 导致解析错误）
-                    if (pkg_len < 40 || pkg_len > BUFFER_SIZE) {
-                        printf("[Parse] Invalid package length: %d (PkgLen=%d, PkgId=%d)\n", 
-                                pkg_len, header->u16PkgLen, header->u16PkgId);
-                        // 跳过这个包头
-                        memmove(recv_buffer, recv_buffer + 4, buffer_data_len - 4);
-                        buffer_data_len -= 4;
-                        continue;
-                    }
-                   
-                    if (buffer_data_len < pkg_len) {
-                            //printf("[Parse] Incomplete package: have %d bytes, need %d bytes\n", buffer_data_len, pkg_len);
-                            break;  // 数据不足，等待更多数据
-                    }
-                   
-                    // 处理包
-                    if (is_json) {
-                        handle_command_package(recv_buffer, pkg_len);
-                    } else if (is_video) {
-                        handle_video_package(video_mgr, recv_buffer, pkg_len);
-                    }
-                    
-                    // 移除已处理的包
-                    memmove(recv_buffer, recv_buffer + pkg_len, buffer_data_len - pkg_len);
-                    buffer_data_len -= pkg_len;
+        // 从网络队列消费已组装的完整包（最多处理 N 个以避免长时间占用主循环）
+        int processed = 0;
+        const int MAX_PROC_PER_LOOP = 8;
+        while (processed < MAX_PROC_PER_LOOP) {
+            PackageNode* node = pop_package_from_queue();
+            if (!node) break;
 
-                    //printf("[Parse] Complete package received: %d bytes (PkgId=%d, u16PkgIndex=%d), left %d bytes\n", 
-                           //pkg_len, header->u16PkgId, header->u16PkgIndex, buffer_data_len);
-                }
+            unsigned char* pkg = node->data;
+            int pkg_len = node->len;
+
+            int is_json = (memcmp(pkg, PKG_JSON_PREFIX, 4) == 0);
+            if (is_json) {
+                handle_command_package(pkg, pkg_len);
+            } else {
+                handle_video_package(video_mgr, pkg, pkg_len);
             }
+
+            free(pkg);
+            free(node);
+            processed++;
         }
         
         // 短暂休眠
@@ -1323,6 +1409,26 @@ int main(int argc, char* argv[]) {
     } else {
         printf("Session closed successfully\n\n");
     }
+    
+    // 停止网络线程并清理队列
+    if (g_net_thread) {
+        g_net_thread_run = 0; // 请求线程退出
+        // 唤醒网络线程（如果在阻塞读之外等待）
+        if (g_pkg_event) SetEvent(g_pkg_event);
+        WaitForSingleObject(g_net_thread, 2000);
+        CloseHandle(g_net_thread);
+        g_net_thread = NULL;
+    }
+
+    // 清空队列残余包
+    while (1) {
+        PackageNode* n = pop_package_from_queue();
+        if (!n) break;
+        if (n->data) free(n->data);
+        free(n);
+    }
+    if (g_pkg_event) { CloseHandle(g_pkg_event); g_pkg_event = NULL; }
+    DeleteCriticalSection(&g_pkg_cs);
     
     // 反初始化 PPCS
     printf("Deinitializing PPCS API...\n");
